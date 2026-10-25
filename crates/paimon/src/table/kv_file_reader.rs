@@ -81,9 +81,6 @@ pub(crate) struct KeyValueReadConfig {
     /// Full table keys also protect partition-PK fields from aggregation.
     pub table_primary_keys: Vec<String>,
     pub merge_engine: MergeEngine,
-    /// `merge-engine` was set by dynamic options, so files written under
-    /// `table_schema_id` may still hold another engine's output.
-    pub merge_engine_overridden: bool,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
     /// Merge files from all supplied splits into one globally key-sorted stream.
@@ -780,13 +777,9 @@ impl KeyValueFileReader {
                     if skip_merge {
                         'files: for run in &merge_group {
                             for file in &run.files {
-                                // Dynamic options can override the engine but keep
-                                // the schema ID, so only then check the stored one.
-                                if file.file.schema_id == table_schema_id
-                                    && !config.merge_engine_overridden
-                                {
-                                    continue;
-                                }
+                                // Always check the stored schema: dynamic options and
+                                // time travel can change the read schema's engine
+                                // without changing its ID.
                                 let schema =
                                     config.schema_manager.schema(file.file.schema_id).await?;
                                 let engine =
@@ -2076,6 +2069,7 @@ mod tests {
                 ("deletion-vectors.merge-on-read", "true"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
 
         let mut files = Vec::new();
         for i in 0..10 {
@@ -2213,7 +2207,6 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
-                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2335,7 +2328,6 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
-                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2541,7 +2533,6 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
-                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2631,7 +2622,6 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
-                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -2691,6 +2681,7 @@ mod tests {
                 ("read.parquet.row-group.parallelism", "1"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
         let low =
             write_multi_row_group_kv_file(&file_io, table_path, "low.parquet", 0, 0, 10).await;
         let high =
@@ -2747,6 +2738,7 @@ mod tests {
                 ("read.parquet.row-group.parallelism", "1"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
         let first_low =
             write_multi_row_group_kv_file(&file_io, table_path, "first-low.parquet", 0, 0, 10)
                 .await;
@@ -2880,6 +2872,7 @@ mod tests {
         ] {
             let table_path = "memory:/kv_legacy_retract";
             let table = pk_table(&file_io, table_path, &options);
+            write_schema_file(&table, table.schema()).await;
             let a = write_legacy_kv_file(&file_io, table_path, "a.parquet", &adds).await;
             let b = write_legacy_kv_file(&file_io, table_path, "b.parquet", &retract).await;
             let split = DataSplitBuilder::new()
@@ -2899,7 +2892,6 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
-                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -2991,7 +2983,6 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
-                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -3052,9 +3043,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_run_read_merges_when_options_override_the_engine() {
-        // copy_with_options keeps the schema ID, so the files and the read
-        // schema share it while the stored engine is still aggregation.
+    async fn single_run_read_merges_when_the_read_schema_names_another_engine() {
+        // Dynamic options and time travel can give the read schema another
+        // engine under the files' schema ID; the stored engine is aggregation.
         let file_io = test_file_io();
         let table_path = "memory:/kv_engine_override";
         let old = pk_table(
@@ -3066,15 +3057,14 @@ mod tests {
             ],
         );
         write_schema_file(&old, old.schema()).await;
-        let table = old.copy_with_options(HashMap::from([(
+        let overridden = old.copy_with_options(HashMap::from([(
             "merge-engine".to_string(),
             "deduplicate".to_string(),
         )]));
-        assert_eq!(table.schema().id(), old.schema().id());
-        assert_eq!(
-            table.schema().core_options().merge_engine().unwrap(),
-            MergeEngine::Deduplicate
-        );
+        // Same read schema as a historical read after an ALTER to deduplicate.
+        let rewrapped = old
+            .copy_with_resolved_schema(overridden.schema().clone(), "main")
+            .unwrap();
         let a =
             write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
         let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
@@ -3087,9 +3077,16 @@ mod tests {
             .with_data_files(vec![a, b])
             .build()
             .unwrap();
-        let batches = read_kv_split(&table, split).await;
-        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
-        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+        for table in [&overridden, &rewrapped] {
+            assert_eq!(table.schema().id(), old.schema().id());
+            assert_eq!(
+                table.schema().core_options().merge_engine().unwrap(),
+                MergeEngine::Deduplicate
+            );
+            let batches = read_kv_split(table, split.clone()).await;
+            assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+            assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+        }
     }
 
     #[tokio::test]
@@ -3097,6 +3094,7 @@ mod tests {
         let file_io = test_file_io();
         let table_path = "memory:/kv_sorted_run";
         let table = pk_table(&file_io, table_path, &[]);
+        write_schema_file(&table, table.schema()).await;
         let low =
             write_multi_row_group_kv_file(&file_io, table_path, "low.parquet", 0, 0, 10).await;
         let high =
@@ -3124,7 +3122,6 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
-                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -3194,7 +3191,6 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
-                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
